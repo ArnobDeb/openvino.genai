@@ -41,6 +41,11 @@ protected:
 
     size_t m_num_decoder_layers = 0;
 
+    // RestoreKV: token ids of the learned restore tokens (from the model's rt_info "restorekv"); their KV entries
+    // are protected from cache eviction. m_num_restore_tokens == 0 means RestoreKV is off.
+    int64_t m_restore_first_token_id = 0;
+    size_t m_num_restore_tokens = 0;
+
     // Pre-allocated per-layer storages for the per-token cache re-rotation deltas used in cache eviction case
     std::vector<ov::Tensor> m_rotation_deltas_stores;
 
@@ -89,6 +94,7 @@ protected:
     /**
      * Performs KV cache eviction is enabled / requireed
      */
+    void _protect_restore_tokens(size_t seq_id, CacheEvictionAlgorithm& algo);
     void _maybe_evict_cache_blocks(const SchedulerConfig& sched_config, const Scheduler::Output& scheduler_output);
 
 

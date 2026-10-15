@@ -179,6 +179,13 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
                                                                   // a forked container may not be the same container
     }
 
+    // RestoreKV models (exported with the restore embeddings and token-gated LoRA built in) name their restore tokens
+    if (model->has_rt_info({"restorekv", "first_token_id"})) {
+        // rt_info read from an IR file holds strings
+        m_restore_first_token_id = std::stoll(model->get_rt_info<std::string>({"restorekv", "first_token_id"}));
+        m_num_restore_tokens = std::stoull(model->get_rt_info<std::string>({"restorekv", "num_tokens"}));
+    }
+
     ov::CompiledModel compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     std::vector<std::string> execution_devices = compiled_model.get_property(ov::execution_devices);
     const bool all_gpu_device =
@@ -1024,6 +1031,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
         if (m_seq_group_id_to_cache_eviction_algo_map.find(seq_id) == m_seq_group_id_to_cache_eviction_algo_map.end()) {
             constexpr size_t MAX_POOL_WINDOW_SIZE = 7;
             m_seq_group_id_to_cache_eviction_algo_map[seq_id] = CacheEvictionAlgorithm(sched_config.cache_eviction_config, m_scheduler->get_block_size(CacheType::KV_CACHE), num_decoder_layers, MAX_POOL_WINDOW_SIZE);
+            if (m_num_restore_tokens > 0) {
+                _protect_restore_tokens(seq_id, m_seq_group_id_to_cache_eviction_algo_map[seq_id]);
+            }
         }
         auto& cache_eviction_algo = m_seq_group_id_to_cache_eviction_algo_map[seq_id];
         std::set<size_t> skip_set;
@@ -1081,6 +1091,27 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
         auto num_blocks_evicted = seq_group_ptr_and_num_blocks_evicted.second;
         seq_group_ptr->register_token_eviction(num_blocks_evicted * m_scheduler->get_block_size(CacheType::KV_CACHE));
     }
+}
+
+void ContinuousBatchingPipeline::ContinuousBatchingImpl::_protect_restore_tokens(size_t seq_id,
+                                                                                CacheEvictionAlgorithm& algo) {
+    // The restore tokens are placed in the prompt by the caller (document, restore tokens, question). Their position
+    // is found from the prompt ids; prompts without them are evicted as usual.
+    auto it = std::find_if(m_requests.begin(), m_requests.end(), [seq_id](const SequenceGroup::Ptr& val) {
+        return val->has_sequence_with_id(seq_id);
+    });
+    if (it == m_requests.end()) {
+        return;
+    }
+    const auto& prompt_ids = (*it)->get_prompt_ids();
+    const int64_t first = m_restore_first_token_id;
+    const int64_t last = first + static_cast<int64_t>(m_num_restore_tokens);
+    auto begin = std::find_if(prompt_ids.begin(), prompt_ids.end(), [&](int64_t id) { return id >= first && id < last; });
+    if (begin == prompt_ids.end()) {
+        return;
+    }
+    auto end = std::find_if(begin, prompt_ids.end(), [&](int64_t id) { return id < first || id >= last; });
+    algo.set_protected_token_range(std::distance(prompt_ids.begin(), begin), std::distance(prompt_ids.begin(), end));
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::_set_adaptive_rkv_diversity_blocks(

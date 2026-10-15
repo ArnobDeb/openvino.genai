@@ -223,6 +223,12 @@ public:
 
     void register_block_diversity(const BlockDiversityForEachDecoderLayer& token_similarity_for_all_decoder_layers);
 
+    /**
+     * Marks the tokens [begin, end) of the sequence (RestoreKV restore tokens) as never evictable. Their logical
+     * blocks are kept in every layer and count towards max_cache_size. Must be called before the first eviction.
+     */
+    void set_protected_token_range(std::size_t begin, std::size_t end);
+
 
 private:
     std::size_t get_num_blocks(std::size_t num_tokens) const;
@@ -245,6 +251,9 @@ private:
     EvictionScoreManager m_score_manager;
 
     std::vector<std::vector<double>> m_last_block_diversity;
+
+    // Logical block indices (per layer) that must not be evicted; shifted down as earlier blocks are evicted
+    std::vector<std::set<std::size_t>> m_protected_blocks;
 };
 
 

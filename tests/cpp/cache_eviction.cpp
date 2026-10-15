@@ -1796,3 +1796,54 @@ TEST_P(AdaptiveRKVBlockCalculatorGetMostDiverseBlocksParameterizedTest, GetsMost
 INSTANTIATE_TEST_SUITE_P(VariousInputs,
                          AdaptiveRKVBlockCalculatorGetMostDiverseBlocksParameterizedTest,
                          testing::ValuesIn(ADAPTIVE_RKV_BLOCK_CALCULATOR_GET_MOST_DIVERSE_BLOCKS_TEST_CASES));
+
+// RestoreKV: tokens marked as protected are never evicted, also when their blocks have the lowest scores, and stay
+// protected after earlier blocks have been evicted (their logical block indices move down).
+TEST(CacheEvictionProtectedTokensTest, ProtectedBlocksAreNeverEvicted) {
+    size_t num_decoder_layers = DEFAULT_NUM_DECODER_LAYERS;
+    auto algo = ov::genai::CacheEvictionAlgorithm(DEFAULT_CACHE_EVICTION_CONFIG, DEFAULT_BLOCK_SIZE, num_decoder_layers,
+                                                  /* max_pool_window_size = */ 1);
+    // block size 4: tokens 48..55 are blocks 12 and 13
+    algo.set_protected_token_range(48, 56);
+
+    size_t num_tokens = algo.get_max_cache_size_after_eviction() + 5 * 4 + 2;  // 6 blocks to be evicted
+    auto scores = get_mock_scores(num_decoder_layers, num_tokens);
+    for (auto& scores_per_layer : scores) {
+        fill_scores(scores_per_layer, 0, scores_per_layer.get_size(), 1.0);
+        for (size_t block : {12, 13, 20, 24, 31, 40}) {
+            fill_scores(scores_per_layer, DEFAULT_BLOCK_SIZE * block, DEFAULT_BLOCK_SIZE * (block + 1), 0.0);
+        }
+    }
+    algo.register_new_token_scores(scores);
+    auto evicted = algo.evict_logical_blocks();
+    // 12 and 13 are kept; the two missing blocks are taken from the beginning of the evictable area instead
+    for (size_t layer_idx = 0; layer_idx < num_decoder_layers; layer_idx++) {
+        EXPECT_EQ(evicted[layer_idx], std::set<size_t>({8, 9, 20, 24, 31, 40}));
+    }
+
+    // second eviction: blocks 8 and 9 are gone, so the protected blocks are now 10 and 11
+    num_tokens = num_tokens - 6 * DEFAULT_BLOCK_SIZE + 2 * DEFAULT_BLOCK_SIZE;
+    scores = get_mock_scores(num_decoder_layers, num_tokens);
+    for (auto& scores_per_layer : scores) {
+        fill_scores(scores_per_layer, 0, scores_per_layer.get_size(), 1.0);
+        for (size_t block : {10, 11}) {
+            fill_scores(scores_per_layer, DEFAULT_BLOCK_SIZE * block, DEFAULT_BLOCK_SIZE * (block + 1), 0.0);
+        }
+    }
+    algo.register_new_token_scores(scores);
+    evicted = algo.evict_logical_blocks();
+    for (size_t layer_idx = 0; layer_idx < num_decoder_layers; layer_idx++) {
+        EXPECT_FALSE(evicted[layer_idx].empty());
+        EXPECT_EQ(evicted[layer_idx].count(10), 0);
+        EXPECT_EQ(evicted[layer_idx].count(11), 0);
+    }
+}
+
+TEST(CacheEvictionProtectedTokensTest, ThrowsIfSetAfterEviction) {
+    auto algo = ov::genai::CacheEvictionAlgorithm(DEFAULT_CACHE_EVICTION_CONFIG, DEFAULT_BLOCK_SIZE,
+                                                  DEFAULT_NUM_DECODER_LAYERS, /* max_pool_window_size = */ 1);
+    algo.register_new_token_scores(
+        get_mock_scores(DEFAULT_NUM_DECODER_LAYERS, algo.get_max_cache_size_after_eviction() + DEFAULT_BLOCK_SIZE));
+    algo.evict_logical_blocks();
+    EXPECT_THROW(algo.set_protected_token_range(48, 56), ov::Exception);
+}

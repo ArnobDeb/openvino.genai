@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "continuous_batching/cache/cache_eviction.hpp"
+#include <algorithm>
+#include <limits>
 #include <queue>
 
 namespace ov::genai {
@@ -360,6 +362,18 @@ namespace ov::genai {
             } else {
                 // Only the blocks in the "intermediate" part of the logical KV cache will be considered for eviction
                 size_t num_blocks_to_evict = get_num_blocks_to_evict(decoder_layer_idx);
+                if (!m_protected_blocks.empty()) {
+                    // RestoreKV: protected blocks are kept as if they had the highest score
+                    size_t start_blocks = get_num_blocks(m_eviction_config.get_start_size());
+                    size_t num_protected = 0;
+                    for (size_t block : m_protected_blocks[decoder_layer_idx]) {
+                        if (block >= start_blocks && block - start_blocks < scores_for_all_evictable_blocks.size()) {
+                            scores_for_all_evictable_blocks[block - start_blocks] = std::numeric_limits<double>::max();
+                            num_protected++;
+                        }
+                    }
+                    num_blocks_to_evict = std::min(num_blocks_to_evict, scores_for_all_evictable_blocks.size() - num_protected);
+                }
                 evicted_block_indices = get_indices_of_blocks_to_evict(scores_for_all_evictable_blocks, num_blocks_to_evict);
                 // KVCrush: start
                 bool should_apply_kvcrush = (m_eviction_config.kvcrush_config.budget > 0) &&
@@ -394,6 +408,23 @@ namespace ov::genai {
                 // KVCrush: end
             }
 
+            if (!m_protected_blocks.empty()) {
+                size_t start_blocks = get_num_blocks(m_eviction_config.get_start_size());
+                auto& protected_blocks = m_protected_blocks[decoder_layer_idx];
+                evicted_block_indices.erase(
+                    std::remove_if(evicted_block_indices.begin(), evicted_block_indices.end(),
+                                   [&](size_t idx) { return protected_blocks.count(idx + start_blocks) > 0; }),
+                    evicted_block_indices.end());
+                // the remaining blocks move down by the number of evicted blocks in front of them
+                std::set<size_t> shifted;
+                for (size_t block : protected_blocks) {
+                    size_t num_before = std::count_if(evicted_block_indices.begin(), evicted_block_indices.end(),
+                                                      [&](size_t idx) { return idx + start_blocks < block; });
+                    shifted.insert(block - num_before);
+                }
+                protected_blocks = std::move(shifted);
+            }
+
             m_num_evicted_tokens += evicted_block_indices.size() * m_block_size;
 
             // No longer need to track the overall "heavy-hitter" attention scores for freshly evicted blocks
@@ -408,6 +439,17 @@ namespace ov::genai {
         return retval;
     }
 
+
+    void CacheEvictionAlgorithm::set_protected_token_range(std::size_t begin, std::size_t end) {
+        OPENVINO_ASSERT(begin < end, "empty protected token range");
+        OPENVINO_ASSERT(m_num_evicted_tokens == 0, "the protected token range must be set before the first eviction");
+        // a block that holds any protected token is protected as a whole
+        std::set<size_t> blocks;
+        for (size_t block = begin / m_block_size; block <= (end - 1) / m_block_size; ++block) {
+            blocks.insert(block);
+        }
+        m_protected_blocks.assign(m_num_decoder_layers, blocks);
+    }
 
     CacheEvictionAlgorithm::CacheEvictionRange CacheEvictionAlgorithm::get_evictable_block_range() const {
         return get_evictable_block_range(0);
