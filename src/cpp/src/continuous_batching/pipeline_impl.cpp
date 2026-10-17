@@ -184,6 +184,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
         // rt_info read from an IR file holds strings
         m_restore_first_token_id = std::stoll(model->get_rt_info<std::string>({"restorekv", "first_token_id"}));
         m_num_restore_tokens = std::stoull(model->get_rt_info<std::string>({"restorekv", "num_tokens"}));
+        const char* query_blind = std::getenv("RESTOREKV_QUERY_BLIND");
+        m_restore_query_blind = query_blind && std::string(query_blind) == "1";
     }
 
     ov::CompiledModel compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
@@ -331,6 +333,18 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
                                                          position_ids,
                                                          rope_delta,
                                                          prompt_ids);
+    }
+    else if (m_restore_query_blind) {
+        // split [document][SEP][question]: the question becomes forced tokens after the one-shot eviction
+        const int64_t sep = m_restore_first_token_id + static_cast<int64_t>(m_num_restore_tokens);
+        const int64_t* ids = input_ids.data<const int64_t>();
+        const size_t n = input_ids.get_size();
+        const size_t pos = std::find(ids, ids + n, sep) - ids;
+        OPENVINO_ASSERT(pos < n, "RESTOREKV_QUERY_BLIND=1 needs a separator token ", sep, " in the prompt");
+        ov::Tensor head(ov::element::i64, {1, pos});
+        std::copy(ids, ids + pos, head.data<int64_t>());
+        sequence_group = std::make_shared<SequenceGroup>(request_id, head, sampling_params_copy, token_type_ids);
+        sequence_group->set_forced_tokens(TokenIds(ids + pos + 1, ids + n));
     }
     else {
         sequence_group = std::make_shared<SequenceGroup>(request_id,
@@ -1027,6 +1041,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
 
     for (auto& seq_id_and_attention_scores : sequence_attention_scores) {
         auto seq_id = seq_id_and_attention_scores.first;
+        if (m_restore_query_blind && m_query_blind_evicted.count(seq_id)) {
+            continue;   // question-blind mode: one eviction right after the document, as in the RestoreKV paper
+        }
         const auto& attention_scores_for_all_decoder_layers = seq_id_and_attention_scores.second;
         if (m_seq_group_id_to_cache_eviction_algo_map.find(seq_id) == m_seq_group_id_to_cache_eviction_algo_map.end()) {
             constexpr size_t MAX_POOL_WINDOW_SIZE = 7;
@@ -1053,8 +1070,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
         OPENVINO_ASSERT(seq_group_ptr_it != m_requests.end(), "could not find sequence group with sequence ", seq_id);
         auto seq_group_ptr = *seq_group_ptr_it;
 
-        if (!seq_group_ptr->can_generate_tokens()) {
-            // do not evict during prefill
+        const bool prompt_done_this_step = seq_group_ptr->get_num_processed_tokens() +
+                                           seq_group_ptr->get_num_scheduled_tokens() >= seq_group_ptr->get_prompt_len();
+        if (!seq_group_ptr->can_generate_tokens() && !(m_restore_query_blind && prompt_done_this_step)) {
+            // do not evict during prefill (question-blind mode: evict right after the last prompt chunk, before
+            // the first question token is processed)
             continue;
         }
 
@@ -1069,6 +1089,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
         m_previous_num_blocks_before_eviction_per_sequence[seq_id] = m_scheduler->get_num_kv_logical_blocks(seq_group_ptr);
 
         auto logical_blocks_to_evict = cache_eviction_algo.evict_logical_blocks();
+        if (m_restore_query_blind) {
+            m_query_blind_evicted.insert(seq_id);
+        }
         m_previous_evicted_block_logical_indices_per_sequence[seq_id] = logical_blocks_to_evict;
 
         m_scheduler->free_blocks_from_sequence(seq_id, logical_blocks_to_evict, CacheType::KV_CACHE);

@@ -1536,6 +1536,10 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                 bool is_generate_n_tokens = false;
                 if (sampling_params.is_greedy_decoding()) {
                     sampled_token = { _greedy_sample(logit_vector, sampling_params.logprobs) };
+                    const auto& forced = sequence_group->get_forced_tokens();
+                    if (generated_and_verified_len < forced.size()) {
+                        sampled_token = Token(0.0f, forced[generated_and_verified_len]);
+                    }
                 } else {
                     // is_multinomial()
                     is_generate_n_tokens = sequence_group->num_total_seqs() == 1;
@@ -1591,7 +1595,9 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                     break;
                 } else {
                     const auto& sampling_params = sequence_group->get_sampling_parameters();
-                    if (is_stop_token_id_hit(sampled_token.m_index, sampling_params.stop_token_ids) && !sampling_params.ignore_eos) {
+                    const bool is_forced_token = generated_and_verified_len < sequence_group->get_forced_tokens().size();
+                    if (is_stop_token_id_hit(sampled_token.m_index, sampling_params.stop_token_ids) && !sampling_params.ignore_eos &&
+                        !is_forced_token) {
                         // Accepted stop token, discard draft candidates speculatively appended after it
                         const size_t trailing_draft_tokens =
                             generated_seq_token_offset > 0 ? generated_seq_token_offset - 1 : 0;

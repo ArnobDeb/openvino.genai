@@ -405,6 +405,7 @@ class SequenceGroup  : public std::enable_shared_from_this<SequenceGroup> {
     std::vector<Sequence::Ptr> m_sequences;
     ov::genai::GenerationConfig m_sampling_params;
     TokenIds m_prompt_ids;
+    TokenIds m_forced_tokens;
     std::vector<std::vector<float>> m_input_embeds;
     std::optional<std::vector<int64_t>> m_token_type_ids;
 
@@ -812,6 +813,16 @@ public:
 
     const TokenIds& get_prompt_ids() const {
         return m_prompt_ids;
+    }
+
+    // RestoreKV question-blind mode: the question is fed after eviction, one token per decode step, by making the
+    // sampler emit these tokens as the first generated tokens (they are part of the returned generation ids).
+    void set_forced_tokens(TokenIds tokens) {
+        m_forced_tokens = std::move(tokens);
+    }
+
+    const TokenIds& get_forced_tokens() const {
+        return m_forced_tokens;
     }
 
     const std::vector<std::vector<float>>& get_input_embeds() const {

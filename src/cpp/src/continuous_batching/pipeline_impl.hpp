@@ -45,6 +45,12 @@ protected:
     // are protected from cache eviction. m_num_restore_tokens == 0 means RestoreKV is off.
     int64_t m_restore_first_token_id = 0;
     size_t m_num_restore_tokens = 0;
+    // Question-blind evaluation (RESTOREKV_QUERY_BLIND=1, RestoreKV models only): a prompt [document][SEP][question]
+    // with SEP = first_token_id + num_tokens is prefilled up to SEP, evicted once, and the question is fed afterwards
+    // on the evicted cache; no further eviction for that sequence. Not a GenAI default: for comparison with the
+    // RestoreKV paper's protocol.
+    bool m_restore_query_blind = false;
+    std::set<size_t> m_query_blind_evicted;
 
     // Pre-allocated per-layer storages for the per-token cache re-rotation deltas used in cache eviction case
     std::vector<ov::Tensor> m_rotation_deltas_stores;
