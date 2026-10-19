@@ -1102,8 +1102,11 @@ std::vector<int64_t> Sampler::_try_finish_generation(SequenceGroup::Ptr& sequenc
     std::vector<int64_t> dropped_seq_ids;
     for (auto& running_sequence : sequence_group->get_running_sequences()) {
         const auto generated_len = running_sequence->get_generated_len();
-        if (sequence_group->get_max_new_tokens() <= generated_len || 
-            is_stop_token_id_hit(running_sequence->get_generated_ids().back(), sampling_params.stop_token_ids) && !sampling_params.ignore_eos) {
+        // RestoreKV question-blind mode: stop tokens inside the forced question do not end the request
+        const bool in_forced_tokens = generated_len <= sequence_group->get_forced_tokens().size();
+        if (sequence_group->get_max_new_tokens() <= generated_len ||
+            is_stop_token_id_hit(running_sequence->get_generated_ids().back(), sampling_params.stop_token_ids) && !sampling_params.ignore_eos &&
+            !in_forced_tokens) {
             // stop sequence by max_new_tokens or stop token (eos included)
             running_sequence->set_status(SequenceStatus::FINISHED);
 
