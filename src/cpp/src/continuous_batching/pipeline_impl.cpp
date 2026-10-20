@@ -185,7 +185,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
         m_restore_first_token_id = std::stoll(model->get_rt_info<std::string>({"restorekv", "first_token_id"}));
         m_num_restore_tokens = std::stoull(model->get_rt_info<std::string>({"restorekv", "num_tokens"}));
         const char* query_blind = std::getenv("RESTOREKV_QUERY_BLIND");
-        m_restore_query_blind = query_blind && std::string(query_blind) == "1";
+        m_restore_query_blind = query_blind && (std::string(query_blind) == "1" || std::string(query_blind) == "2");
+        m_restore_exact_order = query_blind && std::string(query_blind) == "2";
     }
 
     ov::CompiledModel compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
@@ -345,6 +346,9 @@ GenerationHandle ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request
         std::copy(ids, ids + pos, head.data<int64_t>());
         sequence_group = std::make_shared<SequenceGroup>(request_id, head, sampling_params_copy, token_type_ids);
         sequence_group->set_forced_tokens(TokenIds(ids + pos + 1, ids + n));
+        if (m_restore_exact_order && pos + 1 < n && ids[pos + 1] >= m_restore_first_token_id && ids[pos + 1] < sep) {
+            m_exact_order_requests.insert(request_id);
+        }
     }
     else {
         sequence_group = std::make_shared<SequenceGroup>(request_id,
@@ -1053,12 +1057,26 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
             }
         }
         auto& cache_eviction_algo = m_seq_group_id_to_cache_eviction_algo_map[seq_id];
+        size_t restore_tokens_processed = 0;   // exact order: forced restore tokens fed so far, this step included
+        bool exact_order = false;
+        if (m_restore_exact_order) {
+            auto it = std::find_if(m_requests.begin(), m_requests.end(), [seq_id](const SequenceGroup::Ptr& val) {
+                return val->has_sequence_with_id(seq_id);
+            });
+            OPENVINO_ASSERT(it != m_requests.end(), "could not find sequence group with sequence ", seq_id);
+            exact_order = m_exact_order_requests.count((*it)->get_request_id()) > 0;
+            const size_t done = (*it)->get_num_processed_tokens() + (*it)->get_num_scheduled_tokens();
+            restore_tokens_processed = done > (*it)->get_prompt_len() ? done - (*it)->get_prompt_len() : 0;
+        }
+        if (exact_order && restore_tokens_processed > 0 && restore_tokens_processed < m_num_restore_tokens) {
+            continue;   // restore pass in progress: its attention is not part of the eviction scores
+        }
         std::set<size_t> skip_set;
         if (scheduler_output.get_kv_paged_attention_global_data().apply_sparse_attention_mask) {
             skip_set = scheduler_output.get_sparse_attention_skipped_logical_blocks(seq_id);
         }
 
-        if (skip_set.empty()) {
+        if (skip_set.empty() && !(exact_order && restore_tokens_processed > 0)) {
             // For now, will only register token scores from the dense attention stages
             cache_eviction_algo.register_new_token_scores(attention_scores_for_all_decoder_layers, skip_set, scheduler_output.get_score_aggregation_window(seq_id));
         }
@@ -1072,7 +1090,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
 
         const bool prompt_done_this_step = seq_group_ptr->get_num_processed_tokens() +
                                            seq_group_ptr->get_num_scheduled_tokens() >= seq_group_ptr->get_prompt_len();
-        if (!seq_group_ptr->can_generate_tokens() && !(m_restore_query_blind && prompt_done_this_step)) {
+        if (exact_order && restore_tokens_processed != m_num_restore_tokens) {
+            continue;   // exact order: evict only right after the last restore token
+        }
+        if (!exact_order && !seq_group_ptr->can_generate_tokens() &&
+            !(m_restore_query_blind && prompt_done_this_step)) {
             // do not evict during prefill (question-blind mode: evict right after the last prompt chunk, before
             // the first question token is processed)
             continue;
