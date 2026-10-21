@@ -185,8 +185,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(std
         m_restore_first_token_id = std::stoll(model->get_rt_info<std::string>({"restorekv", "first_token_id"}));
         m_num_restore_tokens = std::stoull(model->get_rt_info<std::string>({"restorekv", "num_tokens"}));
         const char* query_blind = std::getenv("RESTOREKV_QUERY_BLIND");
-        m_restore_query_blind = query_blind && (std::string(query_blind) == "1" || std::string(query_blind) == "2");
-        m_restore_exact_order = query_blind && std::string(query_blind) == "2";
+        const std::string mode = query_blind ? query_blind : "";
+        m_restore_query_blind = mode == "1" || mode == "2" || mode == "3";
+        m_restore_exact_order = mode == "2";
+        m_restore_then_continuous = mode == "3";
     }
 
     ov::CompiledModel compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
@@ -1046,7 +1048,17 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_maybe_evict_cache_bloc
     for (auto& seq_id_and_attention_scores : sequence_attention_scores) {
         auto seq_id = seq_id_and_attention_scores.first;
         if (m_restore_query_blind && m_query_blind_evicted.count(seq_id)) {
-            continue;   // question-blind mode: one eviction right after the document, as in the RestoreKV paper
+            if (!m_restore_then_continuous) {
+                continue;   // question-blind mode: one eviction right after the document, as in the RestoreKV paper
+            }
+            // mode 3: no eviction (and no scores) while the question is fed, then GenAI's continuous eviction
+            auto it = std::find_if(m_requests.begin(), m_requests.end(), [seq_id](const SequenceGroup::Ptr& val) {
+                return val->has_sequence_with_id(seq_id);
+            });
+            if (it != m_requests.end() && (*it)->get_num_processed_tokens() + (*it)->get_num_scheduled_tokens() <=
+                                              (*it)->get_prompt_len() + (*it)->get_forced_tokens().size()) {
+                continue;
+            }
         }
         const auto& attention_scores_for_all_decoder_layers = seq_id_and_attention_scores.second;
         if (m_seq_group_id_to_cache_eviction_algo_map.find(seq_id) == m_seq_group_id_to_cache_eviction_algo_map.end()) {

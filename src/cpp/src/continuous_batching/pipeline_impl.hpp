@@ -56,6 +56,10 @@ protected:
     // restore token, and the question follows on the evicted cache. Restore entries lie past the scored range, so
     // they are never evicted; the caller lowers max_cache_size so that they come out of the budget.
     bool m_restore_exact_order = false;
+    // RESTOREKV_QUERY_BLIND=3: inside order as in mode 1 (one eviction after the document, question fed on the
+    // evicted cache), then GenAI's continuous eviction during the answer, so the cache stays at max_cache_size for
+    // long outputs.
+    bool m_restore_then_continuous = false;
     std::set<uint64_t> m_exact_order_requests;   // requests whose forced tokens start with the restore tokens
     std::set<size_t> m_query_blind_evicted;
 
