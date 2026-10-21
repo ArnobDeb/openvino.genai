@@ -41,6 +41,24 @@ protected:
 
     size_t m_num_decoder_layers = 0;
 
+    // RestoreKV: token ids of the learned restore tokens (from the model's rt_info "restorekv"); their KV entries
+    // are protected from cache eviction. m_num_restore_tokens == 0 means RestoreKV is off.
+    int64_t m_restore_first_token_id = 0;
+    size_t m_num_restore_tokens = 0;
+    // Question-blind evaluation (RESTOREKV_QUERY_BLIND=1, RestoreKV models only): a prompt [document][SEP][question]
+    // with SEP = first_token_id + num_tokens is prefilled up to SEP, evicted once, and the question is fed afterwards
+    // on the evicted cache; no further eviction for that sequence. Not a GenAI default: for comparison with the
+    // RestoreKV paper's protocol.
+    bool m_restore_query_blind = false;
+    // RESTOREKV_QUERY_BLIND=2: exact prototype order. The prompt is [document][SEP][restore ids][question]: the
+    // document is prefilled and scored (SnapKV window = last document tokens), the restore tokens are then fed one per
+    // step on the full cache without adding their attention to the scores, eviction happens once after the last
+    // restore token, and the question follows on the evicted cache. Restore entries lie past the scored range, so
+    // they are never evicted; the caller lowers max_cache_size so that they come out of the budget.
+    bool m_restore_exact_order = false;
+    std::set<uint64_t> m_exact_order_requests;   // requests whose forced tokens start with the restore tokens
+    std::set<size_t> m_query_blind_evicted;
+
     // Pre-allocated per-layer storages for the per-token cache re-rotation deltas used in cache eviction case
     std::vector<ov::Tensor> m_rotation_deltas_stores;
 
@@ -89,6 +107,7 @@ protected:
     /**
      * Performs KV cache eviction is enabled / requireed
      */
+    void _protect_restore_tokens(size_t seq_id, CacheEvictionAlgorithm& algo);
     void _maybe_evict_cache_blocks(const SchedulerConfig& sched_config, const Scheduler::Output& scheduler_output);
 
 
